@@ -92,19 +92,35 @@ function parsePriceBR(v) {
 function formatPriceBR(n) {
   return (Math.round(n * 100) / 100).toFixed(2).replace('.', ',');
 }
+function findStockTitle(title) {
+  const stock = loadKeys();
+  if (stock[title] && stock[title].length) return title;
+  const t = String(title || '').trim().toLowerCase();
+  for (const k of Object.keys(stock)) {
+    if (k.toLowerCase() === t && stock[k] && stock[k].length) return k;
+  }
+  // partial match
+  for (const k of Object.keys(stock)) {
+    if ((k.toLowerCase().includes(t) || t.includes(k.toLowerCase())) && stock[k] && stock[k].length) return k;
+  }
+  return null;
+}
 function allocateKey(title) {
   const stock = loadKeys();
-  const list = stock[title];
+  const real = findStockTitle(title);
+  if (!real) return null;
+  const list = stock[real];
   if (!list || !list.length) return null;
   const key = list.shift();
-  if (!list.length) delete stock[title];
-  else stock[title] = list;
+  if (!list.length) delete stock[real];
+  else stock[real] = list;
   saveKeys(stock);
   return key;
 }
 function stockCount(title) {
   const stock = loadKeys();
-  return (stock[title] || []).length;
+  const real = findStockTitle(title);
+  return real ? (stock[real] || []).length : 0;
 }
 
 /** Rate limit simples em memória + disco */
@@ -619,24 +635,44 @@ const server = http.createServer(async (req, res) => {
       if (o.status === 'cancelled' || o.status === 'rejected') {
         return send(res, 400, { ok: false, error: 'Pedido cancelado/rejeitado' }, origin);
       }
-      const key = allocateKey(o.title);
+      // Admin pode enviar key do estoque local do navegador
+      let key = body.key ? String(body.key).trim() : '';
+      if (!key) key = allocateKey(o.title);
       if (!key) {
         o.status = 'awaiting_stock';
         o.validatedAt = new Date().toISOString();
         o.updatedAt = new Date().toISOString();
         list[idx] = o;
         saveResellerOrders(list);
-        return send(res, 409, { ok: false, error: 'Sem key em estoque — pedido ficou aguardando estoque', order: { orderId: o.orderId, status: o.status } }, origin);
+        return send(res, 409, {
+          ok: false,
+          error: 'Sem key no servidor. O painel tentará usar o estoque local do navegador.',
+          needLocalKey: true,
+          order: { orderId: o.orderId, status: o.status, title: o.title, resellerEmail: o.resellerEmail }
+        }, origin);
       }
       o.key = key;
       o.status = 'delivered';
+      o.proofSent = true;
       o.validatedAt = new Date().toISOString();
       o.deliveredAt = new Date().toISOString();
       o.updatedAt = new Date().toISOString();
       list[idx] = o;
       saveResellerOrders(list);
-      console.log('[reseller-validate]', orderId, o.title);
-      return send(res, 200, { ok: true, order: o }, origin);
+      console.log('[reseller-validate]', orderId, o.title, 'key-ok');
+      return send(res, 200, {
+        ok: true,
+        order: {
+          orderId: o.orderId,
+          title: o.title,
+          costPrice: o.costPrice,
+          key: o.key,
+          status: o.status,
+          resellerEmail: o.resellerEmail,
+          resellerName: o.resellerName,
+          deliveredAt: o.deliveredAt
+        }
+      }, origin);
     }
 
     if (method === 'POST' && p === '/api/admin/reseller-orders/reject') {
