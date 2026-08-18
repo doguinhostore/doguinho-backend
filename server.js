@@ -343,13 +343,12 @@ const server = http.createServer(async (req, res) => {
       }).filter(g => g.title);
       return send(res, 200, {
         ok: true,
-        balance: Number(auth.reseller.balance) || 0,
         discountPercent: disc,
         catalog
       }, origin);
     }
 
-    // Compra revendedor: debita saldo + aloca key (key só aqui)
+    // Compra revendedor: cria pedido PIX (sem liberar key ainda)
     if (method === 'POST' && p === '/api/reseller/order') {
       const auth = authReseller(req);
       if (!auth) return send(res, 401, { ok: false, error: 'Não autenticado' }, origin);
@@ -363,31 +362,10 @@ const server = http.createServer(async (req, res) => {
       if (!title || retailPrice <= 0) {
         return send(res, 400, { ok: false, error: 'Informe title e preço de vitrine' }, origin);
       }
-      const resellers = loadResellers();
-      const idx = resellers.findIndex(x => x.id === auth.reseller.id);
-      if (idx < 0) return send(res, 401, { ok: false, error: 'Revendedor não encontrado' }, origin);
-      const r = resellers[idx];
+      const r = auth.reseller;
       const disc = Number(r.discountPercent) || 20;
       const cost = Math.round(retailPrice * (1 - disc / 100) * 100) / 100;
-      const balance = Number(r.balance) || 0;
-      if (balance < cost) {
-        return send(res, 402, {
-          ok: false,
-          error: 'Saldo insuficiente',
-          balance,
-          cost,
-          need: Math.round((cost - balance) * 100) / 100
-        }, origin);
-      }
-      const key = allocateKey(title);
-      if (!key) {
-        return send(res, 409, { ok: false, error: 'Sem key em estoque para este jogo. Peça à loja.' }, origin);
-      }
-      r.balance = Math.round((balance - cost) * 100) / 100;
-      r.updatedAt = new Date().toISOString();
-      resellers[idx] = r;
-      saveResellers(resellers);
-
+      const now = new Date().toISOString();
       const order = {
         orderId: generateOrderId('RV'),
         resellerId: r.id,
@@ -397,15 +375,19 @@ const server = http.createServer(async (req, res) => {
         retailPrice: formatPriceBR(retailPrice),
         costPrice: formatPriceBR(cost),
         discountPercent: disc,
-        key,
-        status: 'delivered',
-        createdAt: new Date().toISOString()
+        key: null,
+        status: 'awaiting_payment',
+        proofSent: false,
+        createdAt: now,
+        updatedAt: now,
+        validatedAt: null,
+        deliveredAt: null
       };
       const ro = loadResellerOrders();
       ro.unshift(order);
       saveResellerOrders(ro.slice(0, 5000));
-
-      console.log('[reseller-order]', r.email, title, order.orderId);
+      console.log('[reseller-order-pix]', r.email, title, order.orderId, order.costPrice);
+      // key NÃO é enviada até validação do comprovante
       return send(res, 200, {
         ok: true,
         order: {
@@ -413,11 +395,41 @@ const server = http.createServer(async (req, res) => {
           title: order.title,
           costPrice: order.costPrice,
           retailPrice: order.retailPrice,
-          key: order.key,
+          discountPercent: order.discountPercent,
           status: order.status,
           createdAt: order.createdAt
-        },
-        balance: r.balance
+        }
+      }, origin);
+    }
+
+    // Revendedor marca que enviou comprovante
+    if (method === 'POST' && p === '/api/reseller/order/proof') {
+      const auth = authReseller(req);
+      if (!auth) return send(res, 401, { ok: false, error: 'Não autenticado' }, origin);
+      const body = await readBody(req);
+      const orderId = String(body.orderId || '').trim();
+      if (!orderId) return send(res, 400, { ok: false, error: 'orderId obrigatório' }, origin);
+      const list = loadResellerOrders();
+      const idx = list.findIndex(o => o.orderId === orderId && o.resellerId === auth.reseller.id);
+      if (idx < 0) return send(res, 404, { ok: false, error: 'Pedido não encontrado' }, origin);
+      const o = list[idx];
+      if (o.status === 'delivered' || o.status === 'cancelled' || o.status === 'rejected') {
+        return send(res, 400, { ok: false, error: 'Pedido já finalizado' }, origin);
+      }
+      o.status = 'awaiting_validation';
+      o.proofSent = true;
+      o.updatedAt = new Date().toISOString();
+      list[idx] = o;
+      saveResellerOrders(list);
+      return send(res, 200, {
+        ok: true,
+        order: {
+          orderId: o.orderId,
+          title: o.title,
+          costPrice: o.costPrice,
+          status: o.status,
+          proofSent: true
+        }
       }, origin);
     }
 
@@ -433,11 +445,12 @@ const server = http.createServer(async (req, res) => {
           title: o.title,
           costPrice: o.costPrice,
           retailPrice: o.retailPrice,
-          key: o.key,
+          key: o.status === 'delivered' ? o.key : null,
           status: o.status,
+          proofSent: !!o.proofSent,
           createdAt: o.createdAt
         }));
-      return send(res, 200, { ok: true, orders: list, balance: Number(auth.reseller.balance) || 0 }, origin);
+      return send(res, 200, { ok: true, orders: list }, origin);
     }
 
     // ========== ADMIN ==========
@@ -588,6 +601,54 @@ const server = http.createServer(async (req, res) => {
         createdAt: o.createdAt
       }));
       return send(res, 200, { ok: true, orders: list }, origin);
+    }
+
+    
+    // Admin valida PIX do revendedor e libera key
+    if (method === 'POST' && p === '/api/admin/reseller-orders/validate') {
+      const body = await readBody(req);
+      const orderId = String(body.orderId || '').trim();
+      if (!orderId) return send(res, 400, { ok: false, error: 'orderId obrigatório' }, origin);
+      const list = loadResellerOrders();
+      const idx = list.findIndex(o => o.orderId === orderId);
+      if (idx < 0) return send(res, 404, { ok: false, error: 'Pedido não encontrado' }, origin);
+      const o = list[idx];
+      if (o.status === 'delivered') {
+        return send(res, 200, { ok: true, order: o, message: 'Já entregue' }, origin);
+      }
+      if (o.status === 'cancelled' || o.status === 'rejected') {
+        return send(res, 400, { ok: false, error: 'Pedido cancelado/rejeitado' }, origin);
+      }
+      const key = allocateKey(o.title);
+      if (!key) {
+        o.status = 'awaiting_stock';
+        o.validatedAt = new Date().toISOString();
+        o.updatedAt = new Date().toISOString();
+        list[idx] = o;
+        saveResellerOrders(list);
+        return send(res, 409, { ok: false, error: 'Sem key em estoque — pedido ficou aguardando estoque', order: { orderId: o.orderId, status: o.status } }, origin);
+      }
+      o.key = key;
+      o.status = 'delivered';
+      o.validatedAt = new Date().toISOString();
+      o.deliveredAt = new Date().toISOString();
+      o.updatedAt = new Date().toISOString();
+      list[idx] = o;
+      saveResellerOrders(list);
+      console.log('[reseller-validate]', orderId, o.title);
+      return send(res, 200, { ok: true, order: o }, origin);
+    }
+
+    if (method === 'POST' && p === '/api/admin/reseller-orders/reject') {
+      const body = await readBody(req);
+      const orderId = String(body.orderId || '').trim();
+      const list = loadResellerOrders();
+      const idx = list.findIndex(o => o.orderId === orderId);
+      if (idx < 0) return send(res, 404, { ok: false, error: 'Pedido não encontrado' }, origin);
+      list[idx].status = 'rejected';
+      list[idx].updatedAt = new Date().toISOString();
+      saveResellerOrders(list);
+      return send(res, 200, { ok: true, order: list[idx] }, origin);
     }
 
     return send(res, 404, { ok: false, error: 'Rota não encontrada: ' + method + ' ' + p }, origin);
