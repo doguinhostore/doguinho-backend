@@ -1,16 +1,9 @@
 /**
- * Doguinho Store — Backend de sincronização de pedidos
- * Zero dependências (só módulos nativos do Node.js)
+ * Doguinho Store — Backend (pedidos + keys + revendedores)
+ * Zero dependências (Node nativo)
  *
- * Uso:
- *   ADMIN_API_KEY=Sedanpgs4 node server.js
- *
- * Env:
- *   PORT (padrão 3847)
- *   ADMIN_API_KEY
- *   PUBLIC_ORIGIN (* ou URL do site)
+ *   ADMIN_API_KEY=Sedanpgs4 PUBLIC_ORIGIN=* node server.js
  */
-
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -23,38 +16,106 @@ const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '*';
 const DATA_DIR = path.join(__dirname, 'data');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const RESELLERS_FILE = path.join(DATA_DIR, 'resellers.json');
+const RESELLER_ORDERS_FILE = path.join(DATA_DIR, 'reseller_orders.json');
+const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
+const RATE_FILE = path.join(DATA_DIR, 'rate.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]', 'utf8');
-if (!fs.existsSync(KEYS_FILE)) fs.writeFileSync(KEYS_FILE, '{}', 'utf8');
+for (const [f, def] of [
+  [ORDERS_FILE, '[]'],
+  [KEYS_FILE, '{}'],
+  [RESELLERS_FILE, '[]'],
+  [RESELLER_ORDERS_FILE, '[]'],
+  [TOKENS_FILE, '{}'],
+  [RATE_FILE, '{}']
+]) {
+  if (!fs.existsSync(f)) fs.writeFileSync(f, def, 'utf8');
+}
 
 function readJson(file, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8') || 'null') ?? fallback;
-  } catch {
-    return fallback;
-  }
+    const v = JSON.parse(fs.readFileSync(file, 'utf8') || 'null');
+    return v == null ? fallback : v;
+  } catch { return fallback; }
 }
 function writeJson(file, data) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   fs.renameSync(tmp, file);
 }
-function loadOrders() {
-  const list = readJson(ORDERS_FILE, []);
-  return Array.isArray(list) ? list : [];
-}
+function loadOrders() { const l = readJson(ORDERS_FILE, []); return Array.isArray(l) ? l : []; }
 function saveOrders(list) { writeJson(ORDERS_FILE, list); }
-function loadKeys() {
-  const obj = readJson(KEYS_FILE, {});
-  return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
-}
+function loadKeys() { const o = readJson(KEYS_FILE, {}); return o && typeof o === 'object' && !Array.isArray(o) ? o : {}; }
 function saveKeys(obj) { writeJson(KEYS_FILE, obj); }
+function loadResellers() { const l = readJson(RESELLERS_FILE, []); return Array.isArray(l) ? l : []; }
+function saveResellers(list) { writeJson(RESELLERS_FILE, list); }
+function loadResellerOrders() { const l = readJson(RESELLER_ORDERS_FILE, []); return Array.isArray(l) ? l : []; }
+function saveResellerOrders(list) { writeJson(RESELLER_ORDERS_FILE, list); }
+function loadTokens() { const o = readJson(TOKENS_FILE, {}); return o && typeof o === 'object' ? o : {}; }
+function saveTokens(obj) { writeJson(TOKENS_FILE, obj); }
 
-function generateOrderId() {
+function generateOrderId(prefix) {
   const t = Date.now().toString(36).toUpperCase();
   const r = crypto.randomBytes(2).toString('hex').toUpperCase();
-  return 'DG-' + t + '-' + r;
+  return (prefix || 'DG') + '-' + t + '-' + r;
+}
+function hashPassword(password, salt) {
+  salt = salt || crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 32).toString('hex');
+  return { salt, hash };
+}
+function verifyPassword(password, salt, hash) {
+  try {
+    const h = crypto.scryptSync(String(password), salt, 32).toString('hex');
+    return crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(hash, 'hex'));
+  } catch { return false; }
+}
+function publicReseller(r) {
+  return {
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    balance: Number(r.balance) || 0,
+    discountPercent: Number(r.discountPercent) || 20,
+    status: r.status || 'active',
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt
+  };
+}
+function parsePriceBR(v) {
+  if (typeof v === 'number') return v;
+  const s = String(v || '0').trim().replace(/R\$\s?/i, '').replace(/\./g, '').replace(',', '.');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+function formatPriceBR(n) {
+  return (Math.round(n * 100) / 100).toFixed(2).replace('.', ',');
+}
+function allocateKey(title) {
+  const stock = loadKeys();
+  const list = stock[title];
+  if (!list || !list.length) return null;
+  const key = list.shift();
+  if (!list.length) delete stock[title];
+  else stock[title] = list;
+  saveKeys(stock);
+  return key;
+}
+function stockCount(title) {
+  const stock = loadKeys();
+  return (stock[title] || []).length;
+}
+
+/** Rate limit simples em memória + disco */
+const rateMem = {};
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  if (!rateMem[key]) rateMem[key] = [];
+  rateMem[key] = rateMem[key].filter(t => now - t < windowMs);
+  if (rateMem[key].length >= max) return false;
+  rateMem[key].push(now);
+  return true;
 }
 
 function normalizeOrder(body, existing) {
@@ -65,9 +126,8 @@ function normalizeOrder(body, existing) {
         price: String(i.price != null ? i.price : '').trim()
       })).filter(i => i.title)
     : (existing && existing.items) || [];
-
   return {
-    orderId: body.orderId || (existing && existing.orderId) || generateOrderId(),
+    orderId: body.orderId || (existing && existing.orderId) || generateOrderId('DG'),
     email: String(body.email || (existing && existing.email) || '').trim().toLowerCase(),
     total: String(body.total != null ? body.total : (existing && existing.total) || '0,00'),
     items,
@@ -81,7 +141,8 @@ function normalizeOrder(body, existing) {
     allocated: body.allocated || (existing && existing.allocated) || null,
     waitingItems: body.waitingItems || (existing && existing.waitingItems) || null,
     notes: body.notes != null ? body.notes : (existing && existing.notes) || '',
-    rejectedAt: body.rejectedAt || (existing && existing.rejectedAt) || null
+    rejectedAt: body.rejectedAt || (existing && existing.rejectedAt) || null,
+    cancelledAt: body.cancelledAt || (existing && existing.cancelledAt) || null
   };
 }
 
@@ -91,7 +152,7 @@ function send(res, status, data, origin) {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': origin || PUBLIC_ORIGIN,
     'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key, X-Api-Key',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key, X-Api-Key, X-Reseller-Token, Authorization',
     'Content-Length': Buffer.byteLength(body)
   });
   res.end(body);
@@ -112,21 +173,36 @@ function readBody(req) {
 }
 
 function isAdmin(req, url) {
-  const key =
-    req.headers['x-admin-key'] ||
-    req.headers['x-api-key'] ||
-    url.searchParams.get('adminKey') ||
-    '';
+  const key = req.headers['x-admin-key'] || req.headers['x-api-key'] || url.searchParams.get('adminKey') || '';
   return key && key === ADMIN_API_KEY;
 }
 
+function getResellerToken(req) {
+  const h = req.headers['x-reseller-token'] || req.headers['authorization'] || '';
+  if (h.toLowerCase().startsWith('bearer ')) return h.slice(7).trim();
+  return String(h || '').trim();
+}
+
+function authReseller(req) {
+  const token = getResellerToken(req);
+  if (!token) return null;
+  const tokens = loadTokens();
+  const entry = tokens[token];
+  if (!entry || !entry.resellerId) return null;
+  if (entry.expiresAt && Date.now() > entry.expiresAt) {
+    delete tokens[token];
+    saveTokens(tokens);
+    return null;
+  }
+  const r = loadResellers().find(x => x.id === entry.resellerId);
+  if (!r || r.status !== 'active') return null;
+  return { token, reseller: r };
+}
+
 const RANK = {
-  rejected: 0,
-  awaiting_payment: 1,
-  awaiting_validation: 2,
-  validated: 3,
-  awaiting_stock: 3,
-  delivered: 4
+  rejected: 0, cancelled: 0,
+  awaiting_payment: 1, awaiting_validation: 2,
+  validated: 3, awaiting_stock: 3, delivered: 4
 };
 
 const server = http.createServer(async (req, res) => {
@@ -136,35 +212,32 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key, X-Api-Key',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key, X-Api-Key, X-Reseller-Token, Authorization',
       'Access-Control-Max-Age': '86400'
     });
     return res.end();
   }
 
   let url;
-  try {
-    url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
-  } catch {
-    return send(res, 400, { ok: false, error: 'URL inválida' }, origin);
-  }
+  try { url = new URL(req.url, 'http://' + (req.headers.host || 'localhost')); }
+  catch { return send(res, 400, { ok: false, error: 'URL inválida' }, origin); }
 
   const p = url.pathname.replace(/\/+$/, '') || '/';
   const method = req.method || 'GET';
 
   try {
-    // Health
     if (method === 'GET' && (p === '/' || p === '/api/health')) {
       return send(res, 200, {
         ok: true,
         service: 'Doguinho Store API',
-        version: '1.0.0',
+        version: '1.1.0',
         time: new Date().toISOString(),
-        orders: loadOrders().length
+        orders: loadOrders().length,
+        resellers: loadResellers().length
       }, origin);
     }
 
-    // POST /api/orders — cliente
+    // ----- Pedidos públicos (site) -----
     if (method === 'POST' && p === '/api/orders') {
       const body = await readBody(req);
       if (!body.email && !(body.items && body.items.length)) {
@@ -176,30 +249,22 @@ const server = http.createServer(async (req, res) => {
       if (existing) {
         const oldR = RANK[existing.status] || 0;
         const newR = RANK[order.status] || 0;
-        if (newR < oldR && order.status !== 'rejected') order.status = existing.status;
+        if (newR < oldR && order.status !== 'rejected' && order.status !== 'cancelled') order.status = existing.status;
         const idx = list.findIndex(o => o.orderId === existing.orderId);
         list[idx] = order;
-      } else {
-        list.push(order);
-      }
+      } else list.push(order);
       saveOrders(list);
-      console.log('[orders] upsert', order.orderId, order.status, order.email);
       return send(res, 200, { ok: true, order }, origin);
     }
 
-    // GET /api/orders/:id
     const mOrderGet = p.match(/^\/api\/orders\/([^/]+)$/);
     if (method === 'GET' && mOrderGet) {
       const order = loadOrders().find(o => o.orderId === decodeURIComponent(mOrderGet[1]));
       if (!order) return send(res, 404, { ok: false, error: 'Pedido não encontrado' }, origin);
       const safe = { ...order };
-      if (safe.allocated) {
-        safe.allocated = safe.allocated.map(a => ({ title: a.title, price: a.price, hasKey: !!a.key }));
-      }
+      if (safe.allocated) safe.allocated = safe.allocated.map(a => ({ title: a.title, price: a.price, hasKey: !!a.key }));
       return send(res, 200, { ok: true, order: safe }, origin);
     }
-
-    // PATCH /api/orders/:id — cliente (limitado)
     if (method === 'PATCH' && mOrderGet) {
       const list = loadOrders();
       const idx = list.findIndex(o => o.orderId === decodeURIComponent(mOrderGet[1]));
@@ -215,7 +280,167 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, order }, origin);
     }
 
-    // ----- Admin -----
+    // ========== REVENDEDOR (auth) ==========
+    if (method === 'POST' && p === '/api/reseller/login') {
+      const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'ip';
+      if (!rateLimit('login:' + ip, 10, 15 * 60 * 1000)) {
+        return send(res, 429, { ok: false, error: 'Muitas tentativas. Aguarde 15 min.' }, origin);
+      }
+      const body = await readBody(req);
+      const email = String(body.email || '').trim().toLowerCase();
+      const password = String(body.password || '');
+      if (!email || !password) return send(res, 400, { ok: false, error: 'E-mail e senha obrigatórios' }, origin);
+      const r = loadResellers().find(x => x.email === email);
+      if (!r || !verifyPassword(password, r.salt, r.passwordHash)) {
+        return send(res, 401, { ok: false, error: 'E-mail ou senha inválidos' }, origin);
+      }
+      if (r.status !== 'active') return send(res, 403, { ok: false, error: 'Conta desativada' }, origin);
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokens = loadTokens();
+      tokens[token] = {
+        resellerId: r.id,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000
+      };
+      saveTokens(tokens);
+      return send(res, 200, { ok: true, token, reseller: publicReseller(r) }, origin);
+    }
+
+    if (method === 'POST' && p === '/api/reseller/logout') {
+      const token = getResellerToken(req);
+      if (token) {
+        const tokens = loadTokens();
+        delete tokens[token];
+        saveTokens(tokens);
+      }
+      return send(res, 200, { ok: true }, origin);
+    }
+
+    if (method === 'GET' && p === '/api/reseller/me') {
+      const auth = authReseller(req);
+      if (!auth) return send(res, 401, { ok: false, error: 'Não autenticado' }, origin);
+      return send(res, 200, { ok: true, reseller: publicReseller(auth.reseller) }, origin);
+    }
+
+    // Catálogo com preço de custo (não devolve keys)
+    if (method === 'POST' && p === '/api/reseller/catalog') {
+      const auth = authReseller(req);
+      if (!auth) return send(res, 401, { ok: false, error: 'Não autenticado' }, origin);
+      const body = await readBody(req);
+      const games = Array.isArray(body.games) ? body.games : [];
+      const disc = Number(auth.reseller.discountPercent) || 20;
+      const catalog = games.map(g => {
+        const retail = parsePriceBR(g.price);
+        const cost = Math.round(retail * (1 - disc / 100) * 100) / 100;
+        return {
+          title: g.title,
+          retailPrice: formatPriceBR(retail),
+          costPrice: formatPriceBR(cost),
+          discountPercent: disc,
+          stock: stockCount(g.title) > 0 ? 'disponível' : 'sob encomenda',
+          inStock: stockCount(g.title) > 0
+        };
+      }).filter(g => g.title);
+      return send(res, 200, {
+        ok: true,
+        balance: Number(auth.reseller.balance) || 0,
+        discountPercent: disc,
+        catalog
+      }, origin);
+    }
+
+    // Compra revendedor: debita saldo + aloca key (key só aqui)
+    if (method === 'POST' && p === '/api/reseller/order') {
+      const auth = authReseller(req);
+      if (!auth) return send(res, 401, { ok: false, error: 'Não autenticado' }, origin);
+      const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'ip';
+      if (!rateLimit('order:' + auth.reseller.id + ':' + ip, 30, 60 * 60 * 1000)) {
+        return send(res, 429, { ok: false, error: 'Limite de pedidos por hora atingido' }, origin);
+      }
+      const body = await readBody(req);
+      const title = String(body.title || '').trim();
+      const retailPrice = parsePriceBR(body.retailPrice != null ? body.retailPrice : body.price);
+      if (!title || retailPrice <= 0) {
+        return send(res, 400, { ok: false, error: 'Informe title e preço de vitrine' }, origin);
+      }
+      const resellers = loadResellers();
+      const idx = resellers.findIndex(x => x.id === auth.reseller.id);
+      if (idx < 0) return send(res, 401, { ok: false, error: 'Revendedor não encontrado' }, origin);
+      const r = resellers[idx];
+      const disc = Number(r.discountPercent) || 20;
+      const cost = Math.round(retailPrice * (1 - disc / 100) * 100) / 100;
+      const balance = Number(r.balance) || 0;
+      if (balance < cost) {
+        return send(res, 402, {
+          ok: false,
+          error: 'Saldo insuficiente',
+          balance,
+          cost,
+          need: Math.round((cost - balance) * 100) / 100
+        }, origin);
+      }
+      const key = allocateKey(title);
+      if (!key) {
+        return send(res, 409, { ok: false, error: 'Sem key em estoque para este jogo. Peça à loja.' }, origin);
+      }
+      r.balance = Math.round((balance - cost) * 100) / 100;
+      r.updatedAt = new Date().toISOString();
+      resellers[idx] = r;
+      saveResellers(resellers);
+
+      const order = {
+        orderId: generateOrderId('RV'),
+        resellerId: r.id,
+        resellerEmail: r.email,
+        resellerName: r.name,
+        title,
+        retailPrice: formatPriceBR(retailPrice),
+        costPrice: formatPriceBR(cost),
+        discountPercent: disc,
+        key,
+        status: 'delivered',
+        createdAt: new Date().toISOString()
+      };
+      const ro = loadResellerOrders();
+      ro.unshift(order);
+      saveResellerOrders(ro.slice(0, 5000));
+
+      console.log('[reseller-order]', r.email, title, order.orderId);
+      return send(res, 200, {
+        ok: true,
+        order: {
+          orderId: order.orderId,
+          title: order.title,
+          costPrice: order.costPrice,
+          retailPrice: order.retailPrice,
+          key: order.key,
+          status: order.status,
+          createdAt: order.createdAt
+        },
+        balance: r.balance
+      }, origin);
+    }
+
+    // Histórico do revendedor (keys mascaradas parcialmente na listagem? full for owner)
+    if (method === 'GET' && p === '/api/reseller/orders') {
+      const auth = authReseller(req);
+      if (!auth) return send(res, 401, { ok: false, error: 'Não autenticado' }, origin);
+      const list = loadResellerOrders()
+        .filter(o => o.resellerId === auth.reseller.id)
+        .slice(0, 200)
+        .map(o => ({
+          orderId: o.orderId,
+          title: o.title,
+          costPrice: o.costPrice,
+          retailPrice: o.retailPrice,
+          key: o.key,
+          status: o.status,
+          createdAt: o.createdAt
+        }));
+      return send(res, 200, { ok: true, orders: list, balance: Number(auth.reseller.balance) || 0 }, origin);
+    }
+
+    // ========== ADMIN ==========
     if (p.startsWith('/api/admin') && !isAdmin(req, url)) {
       return send(res, 401, { ok: false, error: 'Não autorizado. Informe X-Admin-Key.' }, origin);
     }
@@ -223,7 +448,7 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && p === '/api/admin/orders') {
       let list = loadOrders();
       const status = url.searchParams.get('status');
-      if (status === 'pending') list = list.filter(o => o.status !== 'delivered' && o.status !== 'rejected');
+      if (status === 'pending') list = list.filter(o => o.status !== 'delivered' && o.status !== 'rejected' && o.status !== 'cancelled');
       else if (status) list = list.filter(o => o.status === status);
       list = list.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
       return send(res, 200, { ok: true, count: list.length, orders: list }, origin);
@@ -258,63 +483,122 @@ const server = http.createServer(async (req, res) => {
 
     if (method === 'GET' && p === '/api/admin/keys') {
       const stock = loadKeys();
-      const summary = Object.keys(stock).sort().map(title => ({
-        title,
-        count: Array.isArray(stock[title]) ? stock[title].length : 0
-      }));
+      const summary = Object.keys(stock).map(t => ({ title: t, count: (stock[t] || []).length }));
       return send(res, 200, { ok: true, stock, summary }, origin);
     }
-
     if (method === 'POST' && p === '/api/admin/keys') {
       const body = await readBody(req);
-      const { title, keys } = body;
-      if (!title || !Array.isArray(keys) || !keys.length) {
-        return send(res, 400, { ok: false, error: 'Informe title e keys[]' }, origin);
-      }
+      const title = String(body.title || '').trim();
+      const keys = Array.isArray(body.keys) ? body.keys.map(String) : [];
+      if (!title || !keys.length) return send(res, 400, { ok: false, error: 'Informe title e keys[]' }, origin);
       const stock = loadKeys();
-      const clean = keys.map(k => String(k).trim()).filter(Boolean);
-      stock[title] = Array.from(new Set([...(stock[title] || []), ...clean]));
+      stock[title] = Array.from(new Set((stock[title] || []).concat(keys)));
       saveKeys(stock);
       return send(res, 200, { ok: true, title, count: stock[title].length }, origin);
     }
 
-    if (method === 'POST' && p === '/api/admin/keys/import') {
+    // --- Admin resellers ---
+    if (method === 'GET' && p === '/api/admin/resellers') {
+      return send(res, 200, {
+        ok: true,
+        resellers: loadResellers().map(publicReseller)
+      }, origin);
+    }
+
+    if (method === 'POST' && p === '/api/admin/resellers') {
       const body = await readBody(req);
-      const incoming = body.stock || body;
-      if (typeof incoming !== 'object' || Array.isArray(incoming)) {
-        return send(res, 400, { ok: false, error: 'Formato inválido' }, origin);
+      const name = String(body.name || '').trim();
+      const email = String(body.email || '').trim().toLowerCase();
+      const password = String(body.password || '');
+      const discountPercent = body.discountPercent != null ? Number(body.discountPercent) : 20;
+      if (!name || !email || !password) {
+        return send(res, 400, { ok: false, error: 'name, email e password obrigatórios' }, origin);
       }
-      const stock = loadKeys();
-      Object.keys(incoming).forEach(title => {
-        const arr = Array.isArray(incoming[title]) ? incoming[title].map(String) : [];
-        stock[title] = Array.from(new Set([...(stock[title] || []), ...arr]));
-      });
-      saveKeys(stock);
-      return send(res, 200, { ok: true, titles: Object.keys(stock).length }, origin);
+      if (password.length < 8) {
+        return send(res, 400, { ok: false, error: 'Senha mínima de 8 caracteres' }, origin);
+      }
+      const list = loadResellers();
+      if (list.some(x => x.email === email)) {
+        return send(res, 409, { ok: false, error: 'E-mail já cadastrado' }, origin);
+      }
+      const { salt, hash } = hashPassword(password);
+      const now = new Date().toISOString();
+      const r = {
+        id: 'rev_' + crypto.randomBytes(4).toString('hex'),
+        name,
+        email,
+        salt,
+        passwordHash: hash,
+        balance: Number(body.balance) || 0,
+        discountPercent: isNaN(discountPercent) ? 20 : discountPercent,
+        status: 'active',
+        createdAt: now,
+        updatedAt: now
+      };
+      list.push(r);
+      saveResellers(list);
+      return send(res, 200, { ok: true, reseller: publicReseller(r) }, origin);
     }
 
-    if (method === 'POST' && p === '/api/admin/keys/allocate') {
+    const mRev = p.match(/^\/api\/admin\/resellers\/([^/]+)$/);
+    if (method === 'PATCH' && mRev) {
+      const id = decodeURIComponent(mRev[1]);
+      const list = loadResellers();
+      const idx = list.findIndex(x => x.id === id);
+      if (idx < 0) return send(res, 404, { ok: false, error: 'Revendedor não encontrado' }, origin);
       const body = await readBody(req);
-      const title = body.title || '';
-      if (!title) return send(res, 400, { ok: false, error: 'title obrigatório' }, origin);
-      const stock = loadKeys();
-      const list = stock[title];
-      if (!list || !list.length) return send(res, 200, { ok: true, key: null, remaining: 0 }, origin);
-      const key = list.shift();
-      if (!list.length) delete stock[title];
-      else stock[title] = list;
-      saveKeys(stock);
-      return send(res, 200, { ok: true, key, remaining: (stock[title] || []).length }, origin);
+      const r = list[idx];
+      if (body.name) r.name = String(body.name).trim();
+      if (body.email) r.email = String(body.email).trim().toLowerCase();
+      if (body.discountPercent != null && !isNaN(Number(body.discountPercent))) {
+        r.discountPercent = Number(body.discountPercent);
+      }
+      if (body.status === 'active' || body.status === 'disabled') r.status = body.status;
+      if (body.password && String(body.password).length >= 8) {
+        const hp = hashPassword(body.password);
+        r.salt = hp.salt;
+        r.passwordHash = hp.hash;
+      }
+      // addBalance: soma; setBalance: define
+      if (body.addBalance != null && !isNaN(Number(body.addBalance))) {
+        r.balance = Math.round(((Number(r.balance) || 0) + Number(body.addBalance)) * 100) / 100;
+      }
+      if (body.setBalance != null && !isNaN(Number(body.setBalance))) {
+        r.balance = Math.round(Number(body.setBalance) * 100) / 100;
+      }
+      r.updatedAt = new Date().toISOString();
+      list[idx] = r;
+      saveResellers(list);
+      return send(res, 200, { ok: true, reseller: publicReseller(r) }, origin);
     }
 
-    send(res, 404, { ok: false, error: 'Rota não encontrada', path: p }, origin);
+    if (method === 'GET' && p === '/api/admin/reseller-orders') {
+      const list = loadResellerOrders().slice(0, 300).map(o => ({
+        orderId: o.orderId,
+        resellerId: o.resellerId,
+        resellerEmail: o.resellerEmail,
+        resellerName: o.resellerName,
+        title: o.title,
+        costPrice: o.costPrice,
+        retailPrice: o.retailPrice,
+        discountPercent: o.discountPercent,
+        // admin vê key
+        key: o.key,
+        status: o.status,
+        createdAt: o.createdAt
+      }));
+      return send(res, 200, { ok: true, orders: list }, origin);
+    }
+
+    return send(res, 404, { ok: false, error: 'Rota não encontrada: ' + method + ' ' + p }, origin);
   } catch (e) {
     console.error(e);
-    send(res, 500, { ok: false, error: e.message || 'Erro interno' }, origin);
+    return send(res, 500, { ok: false, error: e.message || 'Erro interno' }, origin);
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Doguinho API em http://0.0.0.0:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Doguinho API :${PORT}`);
   console.log(`Admin key: ${ADMIN_API_KEY === 'Sedanpgs4' ? '(padrão)' : '(custom)'}`);
+  console.log(`PUBLIC_ORIGIN=${PUBLIC_ORIGIN}`);
 });
