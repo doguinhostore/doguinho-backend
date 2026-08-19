@@ -27,3 +27,13 @@ Env: `ADMIN_API_KEY`, `PUBLIC_ORIGIN=*`
 Preço de custo = preço vitrine × (1 − desconto%). Padrão **20%**.
 
 Keys **nunca** vão no HTML público; só na resposta autenticada de `/api/reseller/order`.
+
+## Persistência de dados (importante no Render)
+
+O plano free do Render **apaga a pasta `data/`** a cada redeploy/reinício.
+
+Opções:
+1. **Persistent Disk** (Render): monte em `/var/data` e defina env `DATA_DIR=/var/data`
+2. Use o botão **Restaurar revendedores do backup local** no painel admin (backup fica no navegador ao criar a conta)
+
+Sem uma dessas opções, os revendedores “somem” depois que o servidor dorme/reinicia.

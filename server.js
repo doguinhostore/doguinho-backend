@@ -13,7 +13,11 @@ const { URL } = require('url');
 const PORT = Number(process.env.PORT) || 3847;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'Sedanpgs4';
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '*';
-const DATA_DIR = path.join(__dirname, 'data');
+// Em produção no Render: monte um Persistent Disk e defina DATA_DIR=/var/data
+// sem isso, cada redeploy/reinício APAGA os revendedores gravados em disco.
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, 'data');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
 const RESELLERS_FILE = path.join(DATA_DIR, 'resellers.json');
@@ -40,9 +44,23 @@ function readJson(file, fallback) {
   } catch { return fallback; }
 }
 function writeJson(file, data) {
+  const payload = JSON.stringify(data, null, 2);
   const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, payload, 'utf8');
+    const fd = fs.openSync(tmp, 'r+');
+    try { fs.fsyncSync(fd); } catch (e) {}
+    fs.closeSync(fd);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // fallback se rename falhar (filesystems diferentes)
+    fs.writeFileSync(file, payload, 'utf8');
+  }
+  try {
+    const fd2 = fs.openSync(file, 'r+');
+    try { fs.fsyncSync(fd2); } catch (e) {}
+    fs.closeSync(fd2);
+  } catch (e) {}
 }
 function loadOrders() { const l = readJson(ORDERS_FILE, []); return Array.isArray(l) ? l : []; }
 function saveOrders(list) { writeJson(ORDERS_FILE, list); }
@@ -246,10 +264,13 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok: true,
         service: 'Doguinho Store API',
-        version: '1.1.0',
+        version: '1.2.0',
         time: new Date().toISOString(),
+        dataDir: DATA_DIR,
+        persistentHint: !!process.env.DATA_DIR,
         orders: loadOrders().length,
-        resellers: loadResellers().length
+        resellers: loadResellers().length,
+        resellerOrders: loadResellerOrders().length
       }, origin);
     }
 
@@ -566,6 +587,13 @@ const server = http.createServer(async (req, res) => {
       };
       list.push(r);
       saveResellers(list);
+      // verifica se gravou de verdade
+      const verify = loadResellers().find(x => x.id === r.id);
+      if (!verify) {
+        console.error('[resellers] FALHA ao persistir', r.email, RESELLERS_FILE);
+        return send(res, 500, { ok: false, error: 'Falha ao gravar revendedor no disco' }, origin);
+      }
+      console.log('[resellers] criado', r.email, 'total=', loadResellers().length, 'file=', RESELLERS_FILE);
       return send(res, 200, { ok: true, reseller: publicReseller(r) }, origin);
     }
 
@@ -698,4 +726,6 @@ server.listen(PORT, () => {
   console.log(`Doguinho API :${PORT}`);
   console.log(`Admin key: ${ADMIN_API_KEY === 'Sedanpgs4' ? '(padrão)' : '(custom)'}`);
   console.log(`PUBLIC_ORIGIN=${PUBLIC_ORIGIN}`);
+  console.log(`DATA_DIR=${DATA_DIR} (defina DATA_DIR no Render + Persistent Disk para não perder dados)`);
+  console.log(`Resellers no disco: ${loadResellers().length}`);
 });
