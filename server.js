@@ -13,11 +13,27 @@ const { URL } = require('url');
 const PORT = Number(process.env.PORT) || 3847;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'Sedanpgs4';
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN || '*';
-// Em produção no Render: monte um Persistent Disk e defina DATA_DIR=/var/data
-// sem isso, cada redeploy/reinício APAGA os revendedores gravados em disco.
-const DATA_DIR = process.env.DATA_DIR
-  ? path.resolve(process.env.DATA_DIR)
-  : path.join(__dirname, 'data');
+// Em produção no Render: monte Persistent Disk e DATA_DIR=/var/data
+// Se DATA_DIR não for gravável, usa ./data (evita crash → 502)
+function resolveDataDir() {
+  const candidates = [];
+  if (process.env.DATA_DIR) candidates.push(path.resolve(process.env.DATA_DIR));
+  candidates.push(path.join(__dirname, 'data'));
+  candidates.push(path.join('/tmp', 'doguinho-data'));
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, '.write-test');
+      fs.writeFileSync(probe, 'ok', 'utf8');
+      fs.unlinkSync(probe);
+      return dir;
+    } catch (e) {
+      console.warn('[data] não gravável:', dir, e.message);
+    }
+  }
+  return path.join(__dirname, 'data');
+}
+const DATA_DIR = resolveDataDir();
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
 const RESELLERS_FILE = path.join(DATA_DIR, 'resellers.json');
@@ -25,7 +41,9 @@ const RESELLER_ORDERS_FILE = path.join(DATA_DIR, 'reseller_orders.json');
 const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
 const RATE_FILE = path.join(DATA_DIR, 'rate.json');
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+}
 for (const [f, def] of [
   [ORDERS_FILE, '[]'],
   [KEYS_FILE, '{}'],
@@ -34,7 +52,11 @@ for (const [f, def] of [
   [TOKENS_FILE, '{}'],
   [RATE_FILE, '{}']
 ]) {
-  if (!fs.existsSync(f)) fs.writeFileSync(f, def, 'utf8');
+  try {
+    if (!fs.existsSync(f)) fs.writeFileSync(f, def, 'utf8');
+  } catch (e) {
+    console.warn('[data] não criou', f, e.message);
+  }
 }
 
 function readJson(file, fallback) {
@@ -722,10 +744,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Doguinho API :${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Doguinho API :${PORT} (0.0.0.0)`);
   console.log(`Admin key: ${ADMIN_API_KEY === 'Sedanpgs4' ? '(padrão)' : '(custom)'}`);
   console.log(`PUBLIC_ORIGIN=${PUBLIC_ORIGIN}`);
-  console.log(`DATA_DIR=${DATA_DIR} (defina DATA_DIR no Render + Persistent Disk para não perder dados)`);
+  console.log(`DATA_DIR=${DATA_DIR}`);
   console.log(`Resellers no disco: ${loadResellers().length}`);
 });
